@@ -20,11 +20,11 @@ func (f GetterFunc) Get(key string) ([]byte, error) {
 }
 
 // Group 结构表示一个缓存组，包括组名、Getter 接口实现和主缓存。
-type Group struct {
-	name      string // 组的名称
-	getter    Getter // 数据获取接口 :缓存未命中时 获取源数据的回调
-	mainCache cache  // 主缓存：并发缓存
-}
+// type Group struct {
+// 	name      string // 组的名称
+// 	getter    Getter // 数据获取接口 :缓存未命中时 获取源数据的回调
+// 	mainCache cache  // 主缓存：并发缓存
+// }
 
 var (
 	mu     sync.RWMutex              // 用于保护 groups 映射的读写锁
@@ -76,9 +76,9 @@ func (g *Group) Get(key string) (ByteView, error) {
 
 // load 方法用于加载指定键的数据。
 // 它接受一个键名作为参数，调用 getLocally 方法从数据源获取数据，并将数据加载到缓存中。
-func (g *Group) load(key string) (value ByteView, err error) {
-	return g.getLocally(key) // 调用 getLocally 方法获取数据
-}
+// func (g *Group) load(key string) (value ByteView, err error) {
+// 	return g.getLocally(key) // 调用 getLocally 方法获取数据
+// }
 
 // getLocally 方法用于从数据源获取指定键的数据。
 // 它接受一个键名作为参数，调用 Getter 接口的 Get 方法从数据源获取数据。
@@ -97,4 +97,45 @@ func (g *Group) getLocally(key string) (ByteView, error) {
 // 它接受一个键名和 ByteView 作为参数，将数据存入主缓存。
 func (g *Group) populateCache(key string, value ByteView) {
 	g.mainCache.add(key, value) // 将数据存入主缓存
+}
+
+// Group 结构体表示一个缓存命名空间，以及相关的数据分布在多个节点上。
+type Group struct {
+	name      string     // 命名空间的名称
+	getter    Getter     // 用于获取数据的接口
+	mainCache cache      // 本地缓存
+	peers     PeerPicker // 用于选择远程对等节点的接口
+}
+
+// RegisterPeers 方法用于注册一个 PeerPicker，用于选择远程对等节点。
+func (g *Group) RegisterPeers(peers PeerPicker) {
+	if g.peers != nil {
+		panic("RegisterPeerPicker called more than once")
+	}
+	g.peers = peers
+}
+
+// load 方法用于从缓存或远程节点加载数据。
+func (g *Group) load(key string) (value ByteView, err error) {
+	if g.peers != nil {
+		// 如果有远程对等节点可用，尝试从远程节点获取数据。
+		if peer, ok := g.peers.PickPeer(key); ok {
+			if value, err = g.getFromPeer(peer, key); err == nil {
+				return value, nil
+			}
+			log.Println("[GeeCache] Failed to get from peer", err)
+		}
+	}
+
+	// 如果没有可用的远程对等节点或从远程节点获取数据失败，尝试从本地获取数据。
+	return g.getLocally(key)
+}
+
+// getFromPeer 方法用于从远程对等节点获取数据。
+func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
+	bytes, err := peer.Get(g.name, key)
+	if err != nil {
+		return ByteView{}, err
+	}
+	return ByteView{b: bytes}, nil
 }
