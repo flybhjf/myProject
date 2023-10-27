@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"testProject/cache/singleflight"
 )
 
 // 回调函数 缓存未命中时从数据库中读取数据
@@ -34,20 +35,6 @@ var (
 // NewGroup 创建一个新的 Group 实例。
 // 它接受组名、缓存大小限制（cacheBytes），以及实现 Getter 接口的数据获取器（getter）。
 // 如果 getter 为 nil，将会引发 panic。
-func NewGroup(name string, cacheBytes int64, getter Getter) *Group {
-	if getter == nil {
-		panic("nil Getter")
-	}
-	mu.Lock()
-	defer mu.Unlock()
-	g := &Group{
-		name:      name,                          // 设置组名
-		getter:    getter,                        // 设置数据获取器
-		mainCache: cache{cacheBytes: cacheBytes}, // 创建主缓存
-	}
-	groups[name] = g // 将组添加到 groups 映射
-	return g         // 返回创建的 Group 实例
-}
 
 // GetGroup 返回之前使用 NewGroup 创建的具有指定名称的组，如果没有找到则返回 nil。
 func GetGroup(name string) *Group {
@@ -99,36 +86,12 @@ func (g *Group) populateCache(key string, value ByteView) {
 	g.mainCache.add(key, value) // 将数据存入主缓存
 }
 
-// Group 结构体表示一个缓存命名空间，以及相关的数据分布在多个节点上。
-type Group struct {
-	name      string     // 命名空间的名称
-	getter    Getter     // 用于获取数据的接口
-	mainCache cache      // 本地缓存
-	peers     PeerPicker // 用于选择远程对等节点的接口
-}
-
 // RegisterPeers 方法用于注册一个 PeerPicker，用于选择远程对等节点。
 func (g *Group) RegisterPeers(peers PeerPicker) {
 	if g.peers != nil {
 		panic("RegisterPeerPicker called more than once")
 	}
 	g.peers = peers
-}
-
-// load 方法用于从缓存或远程节点加载数据。
-func (g *Group) load(key string) (value ByteView, err error) {
-	if g.peers != nil {
-		// 如果有远程对等节点可用，尝试从远程节点获取数据。
-		if peer, ok := g.peers.PickPeer(key); ok {
-			if value, err = g.getFromPeer(peer, key); err == nil {
-				return value, nil
-			}
-			log.Println("[GeeCache] Failed to get from peer", err)
-		}
-	}
-
-	// 如果没有可用的远程对等节点或从远程节点获取数据失败，尝试从本地获取数据。
-	return g.getLocally(key)
 }
 
 // getFromPeer 方法用于从远程对等节点获取数据。
@@ -138,4 +101,46 @@ func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
 		return ByteView{}, err
 	}
 	return ByteView{b: bytes}, nil
+}
+
+// Group 结构体表示一个缓存命名空间，以及相关的数据分布在多个节点上。
+type Group struct {
+	name      string
+	getter    Getter
+	mainCache cache
+	peers     PeerPicker
+	// 使用 singleflight.Group 以确保每个键只获取一次
+	loader *singleflight.Group
+}
+
+// NewGroup 创建一个新的 Group 实例。
+func NewGroup(name string, cacheBytes int64, getter Getter) *Group {
+	// ...
+	g := &Group{
+		// ...
+		loader: &singleflight.Group{},
+	}
+	return g
+}
+
+// load 方法用于从缓存或远程节点加载数据。
+func (g *Group) load(key string) (value ByteView, err error) {
+	// 确保每个键只被获取一次（无论有多少并发调用）
+	viewi, err := g.loader.Do(key, func() (interface{}, error) {
+		if g.peers != nil {
+			if peer, ok := g.peers.PickPeer(key); ok {
+				if value, err = g.getFromPeer(peer, key); err == nil {
+					return value, nil
+				}
+				log.Println("[GeeCache] Failed to get from peer", err)
+			}
+		}
+
+		return g.getLocally(key)
+	})
+
+	if err == nil {
+		return viewi.(ByteView), nil
+	}
+	return
 }
